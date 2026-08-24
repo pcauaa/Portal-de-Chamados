@@ -1,0 +1,453 @@
+// ============================================================================
+// Portal de Chamados de TI - Modelagem do banco
+//
+// Convencoes adotadas em todo o schema:
+//  - Tabelas e colunas em snake_case (@@map / @map); codigo TypeScript em camelCase.
+//  - Datas sempre em timestamptz (UTC no banco, conversao so na exibicao).
+//  - Dados operacionais (comentarios, anexos, historico) morrem junto com o
+//    chamado (Cascade). Pessoas e catalogo NUNCA sao deletados: sao desativados
+//    (is_active = false) e protegidos por Restrict.
+// ============================================================================
+
+generator client {
+  provider        = "prisma-client"
+  output          = "../src/generated/prisma"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider = "postgresql"
+
+  // A URL de conexao NAO fica aqui: o Prisma 7 removeu o suporte a `url` no
+  // schema. O CLI a le de prisma.config.ts e a aplicacao a injeta via driver
+  // adapter (src/lib/db.ts).
+
+  // Declaradas aqui para que o Prisma as crie tambem no shadow database usado
+  // para validar migrations. citext e o que faz o e-mail de login ser
+  // case-insensitive no proprio banco.
+  extensions = [citext, pgcrypto, pg_trgm]
+}
+
+// ============================================================================
+// ENUMS
+// ============================================================================
+
+enum Priority {
+  BAIXA
+  MEDIA
+  ALTA
+  URGENTE
+
+  @@map("priority")
+}
+
+/// Ciclo de vida do chamado. A distincao RESOLVIDO -> FINALIZADO e proposital:
+/// a TI marca RESOLVIDO, o solicitante confirma (ou o sistema confirma sozinho
+/// apos 3 dias uteis). E isso que produz a metrica de taxa de reabertura.
+enum TicketStatus {
+  ABERTO
+  EM_ANDAMENTO
+  AGUARDANDO_USUARIO
+  RESOLVIDO
+  FINALIZADO
+  CANCELADO
+
+  @@map("ticket_status")
+}
+
+// ============================================================================
+// ORGANIZACAO E ACESSO
+// ============================================================================
+
+model Department {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String   @unique @db.VarChar(80)
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  users   User[]
+  tickets Ticket[]
+
+  @@map("departments")
+}
+
+model Role {
+  id   String @id @default(uuid()) @db.Uuid
+  slug String @unique @db.VarChar(30)
+  name String @db.VarChar(60)
+
+  /// Impede que os 3 perfis base sejam excluidos pela tela de admin.
+  isSystem Boolean @default(false) @map("is_system")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  users       User[]
+  permissions RolePermission[]
+
+  @@map("roles")
+}
+
+model Permission {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// Ex.: "ticket.view_all", "comment.internal", "user.manage".
+  slug        String  @unique @db.VarChar(60)
+  description String? @db.VarChar(160)
+
+  roles RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String @map("role_id") @db.Uuid
+  permissionId String @map("permission_id") @db.Uuid
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model User {
+  id String @id @default(uuid()) @db.Uuid
+
+  name String @db.VarChar(120)
+
+  /// citext: "Joao@empresa.com" e "joao@empresa.com" sao o mesmo login.
+  email String @unique @db.Citext
+
+  passwordHash String  @map("password_hash")
+  phone        String? @db.VarChar(20)
+  avatarUrl    String? @map("avatar_url")
+
+  roleId       String  @map("role_id") @db.Uuid
+  departmentId String? @map("department_id") @db.Uuid
+
+  /// Desativar substitui excluir: preserva a autoria de chamados e comentarios.
+  isActive           Boolean   @default(true) @map("is_active")
+  failedLoginCount   Int       @default(0) @map("failed_login_count") @db.SmallInt
+  lockedUntil        DateTime? @map("locked_until") @db.Timestamptz(6)
+  lastLoginAt        DateTime? @map("last_login_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  role       Role        @relation(fields: [roleId], references: [id], onDelete: Restrict)
+  department Department? @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+
+  sessions         Session[]
+  requestedTickets Ticket[]        @relation("TicketRequester")
+  assignedTickets  Ticket[]        @relation("TicketAssignee")
+  closedTickets    Ticket[]        @relation("TicketClosedBy")
+  comments         TicketComment[]
+  attachments      Attachment[]
+  historyEntries   TicketHistory[]
+  auditLogs        AuditLog[]
+  notifications    Notification[]
+
+  @@index([roleId])
+  @@index([departmentId])
+  @@index([isActive])
+  @@map("users")
+}
+
+/// Sessao persistida no banco (nao JWT): permite revogacao imediata.
+/// Demitiu alguem -> apaga as linhas -> ele esta fora naquele segundo.
+model Session {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// SHA-256 do token que vai no cookie. O token em claro NUNCA e persistido:
+  /// um vazamento do banco nao permite sequestrar sessoes.
+  tokenHash String @unique @map("token_hash") @db.Char(64)
+
+  userId String @map("user_id") @db.Uuid
+
+  ipAddress String? @map("ip_address") @db.VarChar(45)
+  userAgent String? @map("user_agent") @db.VarChar(255)
+
+  expiresAt  DateTime  @map("expires_at") @db.Timestamptz(6)
+  lastSeenAt DateTime  @default(now()) @map("last_seen_at") @db.Timestamptz(6)
+  revokedAt  DateTime? @map("revoked_at") @db.Timestamptz(6)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+// ============================================================================
+// CATALOGO
+// ============================================================================
+
+model Category {
+  id   String @id @default(uuid()) @db.Uuid
+  name String @unique @db.VarChar(60)
+  slug String @unique @db.VarChar(60)
+
+  /// Texto de ajuda exibido no formulario de abertura.
+  description String? @db.VarChar(200)
+
+  /// Nome do icone lucide-react.
+  icon String @default("circle-help") @db.VarChar(40)
+
+  /// Cor hex do badge, ex.: "#2563eb".
+  color String @default("#64748b") @db.VarChar(7)
+
+  defaultPriority Priority @default(MEDIA) @map("default_priority")
+
+  /// Prazo alvo de SLA em horas (Fase 5). Null = sem SLA definido.
+  slaHours Int? @map("sla_hours") @db.SmallInt
+
+  sortOrder Int @default(0) @map("sort_order") @db.SmallInt
+
+  /// Categoria em uso nunca e excluida: e desativada, para nao quebrar o
+  /// historico e os relatorios dos anos anteriores.
+  isActive Boolean @default(true) @map("is_active")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  tickets Ticket[]
+
+  @@index([isActive, sortOrder])
+  @@map("categories")
+}
+
+// ============================================================================
+// CHAMADOS (nucleo)
+// ============================================================================
+
+model Ticket {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// Numero sequencial legivel, exibido como "#000123".
+  /// autoincrement() usa uma SEQUENCE do Postgres: atomica por definicao, o que
+  /// elimina numeros duplicados quando dois chamados sao abertos no mesmo instante.
+  number Int @unique @default(autoincrement())
+
+  title       String @db.VarChar(140)
+  description String
+
+  categoryId String       @map("category_id") @db.Uuid
+  priority   Priority     @default(MEDIA)
+  status     TicketStatus @default(ABERTO)
+
+  requesterId String  @map("requester_id") @db.Uuid
+  assigneeId  String? @map("assignee_id") @db.Uuid
+
+  /// Snapshot do setor do solicitante no momento da abertura. Se ele mudar de
+  /// setor depois, os relatorios historicos continuam corretos.
+  departmentId String? @map("department_id") @db.Uuid
+
+  openedAt DateTime @default(now()) @map("opened_at") @db.Timestamptz(6)
+
+  /// Primeiro comentario publico da TI - metrica de tempo de primeira resposta.
+  firstResponseAt DateTime? @map("first_response_at") @db.Timestamptz(6)
+  resolvedAt      DateTime? @map("resolved_at") @db.Timestamptz(6)
+  closedAt        DateTime? @map("closed_at") @db.Timestamptz(6)
+  closedById      String?   @map("closed_by_id") @db.Uuid
+
+  /// Solucao aplicada, ou motivo do cancelamento.
+  closingNote String? @map("closing_note")
+
+  /// Prazo de SLA calculado na abertura (Fase 5).
+  dueAt DateTime? @map("due_at") @db.Timestamptz(6)
+
+  /// Tempo total (em segundos) que o chamado passou parado em
+  /// AGUARDANDO_USUARIO. Descontado do tempo de atendimento para que a espera
+  /// pelo usuario nao seja contabilizada como lentidao da TI.
+  waitingSeconds Int @default(0) @map("waiting_seconds")
+
+  /// Instante em que entrou em AGUARDANDO_USUARIO (null quando nao esta esperando).
+  waitingSince DateTime? @map("waiting_since") @db.Timestamptz(6)
+
+  reopenedCount Int @default(0) @map("reopened_count") @db.SmallInt
+
+  /// Pesquisa de satisfacao (CSAT), 1 a 5 (Fase 5).
+  rating        Int?    @db.SmallInt
+  ratingComment String? @map("rating_comment")
+
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Preenchido quando a politica de retencao de 90 dias remove anexos,
+  /// comentarios e historico deste chamado (o registro do chamado em si e
+  /// preservado). Null = conteudo intacto. Sem este campo o job de limpeza
+  /// reprocessaria os mesmos chamados encerrados toda noite, e a tela nao
+  /// teria como distinguir "chamado sem comentarios" de "conteudo apagado".
+  purgedAt DateTime? @map("purged_at") @db.Timestamptz(6)
+
+  category   Category    @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  requester  User        @relation("TicketRequester", fields: [requesterId], references: [id], onDelete: Restrict)
+  assignee   User?       @relation("TicketAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  closedBy   User?       @relation("TicketClosedBy", fields: [closedById], references: [id], onDelete: SetNull)
+  department Department? @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+
+  comments      TicketComment[]
+  attachments   Attachment[]
+  history       TicketHistory[]
+  notifications Notification[]
+
+  // Indices desenhados a partir das consultas reais das telas:
+  @@index([status]) // abas da fila da TI
+  @@index([assigneeId, status]) // "meus chamados" do tecnico
+  @@index([requesterId, openedAt(sort: Desc)]) // lista do colaborador
+  @@index([categoryId]) // grafico por categoria
+  @@index([departmentId]) // relatorio por setor
+  @@index([openedAt(sort: Desc)]) // ordenacao padrao e serie mensal
+  @@index([status, priority]) // fila filtrada por prioridade
+  @@index([status, closedAt]) // job de retencao de 90 dias
+  @@map("tickets")
+}
+
+model TicketComment {
+  id       String @id @default(uuid()) @db.Uuid
+  ticketId String @map("ticket_id") @db.Uuid
+  authorId String @map("author_id") @db.Uuid
+
+  /// Markdown restrito. Renderizado com rehype-sanitize (allowlist), nunca HTML bruto.
+  body String
+
+  /// Nota interna, visivel apenas para quem tem a permissao comment.internal.
+  /// O filtro e aplicado na camada de servico - o comentario interno jamais e
+  /// enviado ao cliente para ser escondido via CSS.
+  isInternal Boolean @default(false) @map("is_internal")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  editedAt  DateTime? @map("edited_at") @db.Timestamptz(6)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  ticket      Ticket       @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  author      User         @relation(fields: [authorId], references: [id], onDelete: Restrict)
+  attachments Attachment[]
+
+  @@index([ticketId, createdAt])
+  @@index([authorId])
+  @@map("ticket_comments")
+}
+
+model Attachment {
+  id         String  @id @default(uuid()) @db.Uuid
+  ticketId   String  @map("ticket_id") @db.Uuid
+  /// Preenchido quando o anexo veio junto de um comentario, e nao da abertura.
+  commentId  String? @map("comment_id") @db.Uuid
+  uploaderId String  @map("uploader_id") @db.Uuid
+
+  /// Nome escolhido pelo usuario. Usado apenas para exibicao e no
+  /// Content-Disposition do download - NUNCA para montar caminho em disco.
+  originalName String @map("original_name") @db.VarChar(255)
+
+  /// Nome real em disco: "{uuid}.{ext}". Elimina path traversal e colisao.
+  storedName String @unique @map("stored_name") @db.VarChar(80)
+
+  /// Validado pelo magic number do arquivo, nao pela extensao informada.
+  mimeType  String @map("mime_type") @db.VarChar(100)
+  sizeBytes Int    @map("size_bytes")
+
+  /// Detecta duplicata e corrupcao.
+  checksumSha256 String @map("checksum_sha256") @db.Char(64)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  ticket   Ticket         @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  comment  TicketComment? @relation(fields: [commentId], references: [id], onDelete: Cascade)
+  uploader User           @relation(fields: [uploaderId], references: [id], onDelete: Restrict)
+
+  @@index([ticketId])
+  @@index([commentId])
+  @@map("attachments")
+}
+
+/// Trilha de auditoria do chamado. Populada exclusivamente pelo event bus:
+/// nenhum service grava aqui manualmente, por isso e impossivel esquecer.
+model TicketHistory {
+  id       String  @id @default(uuid()) @db.Uuid
+  ticketId String  @map("ticket_id") @db.Uuid
+  /// Null quando a acao foi do sistema (ex.: fechamento automatico).
+  actorId  String? @map("actor_id") @db.Uuid
+
+  /// Ex.: "created", "status_changed", "assigned", "priority_changed".
+  eventType String  @map("event_type") @db.VarChar(40)
+  field     String? @db.VarChar(40)
+  oldValue  String? @map("old_value") @db.VarChar(160)
+  newValue  String? @map("new_value") @db.VarChar(160)
+
+  /// Payload extra. jsonb permite novos eventos com dados novos sem migration.
+  metadata Json?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  actor  User?  @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([ticketId, createdAt])
+  @@map("ticket_history")
+}
+
+// ============================================================================
+// AUDITORIA, NOTIFICACOES E CONFIGURACAO
+// ============================================================================
+
+/// Eventos do SISTEMA (nao do chamado): login, gestao de usuarios, download de
+/// anexo, mudanca de permissao. Separado de TicketHistory porque tem outro
+/// publico (o admin) e outra politica de retencao.
+model AuditLog {
+  id      String  @id @default(uuid()) @db.Uuid
+  actorId String? @map("actor_id") @db.Uuid
+
+  /// Ex.: "login.success", "login.failed", "user.deactivated", "attachment.downloaded".
+  eventType  String  @map("event_type") @db.VarChar(50)
+  targetType String? @map("target_type") @db.VarChar(40)
+  targetId   String? @map("target_id") @db.Uuid
+
+  ipAddress String? @map("ip_address") @db.VarChar(45)
+  userAgent String? @map("user_agent") @db.VarChar(255)
+  metadata  Json?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([eventType, createdAt(sort: Desc)])
+  @@index([actorId, createdAt(sort: Desc)])
+  @@index([createdAt(sort: Desc)])
+  @@map("audit_logs")
+}
+
+/// Notificacao in-app (Fase 3). A tabela nasce agora para que o handler do
+/// event bus seja plugado depois sem migration.
+model Notification {
+  id       String  @id @default(uuid()) @db.Uuid
+  userId   String  @map("user_id") @db.Uuid
+  ticketId String? @map("ticket_id") @db.Uuid
+
+  type  String  @db.VarChar(40)
+  title String  @db.VarChar(140)
+  body  String? @db.VarChar(300)
+
+  readAt    DateTime? @map("read_at") @db.Timestamptz(6)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ticket Ticket? @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("notifications")
+}
+
+/// Configuracao que a TI altera sem deploy (limites de upload, SMTP, dias para
+/// fechamento automatico).
+model Setting {
+  key         String   @id @db.VarChar(60)
+  value       Json
+  description String?  @db.VarChar(200)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("settings")
+}
