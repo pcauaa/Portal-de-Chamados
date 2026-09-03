@@ -11,8 +11,8 @@ import type { LoginInput } from "./schemas";
  * Regras de autenticacao.
  *
  * O objetivo aqui nao e apenas "conferir a senha": e tornar o login caro para
- * quem estiver tentando adivinhar, sem tornar o sistema irritante para os 15
- * colaboradores que o usam todo dia.
+ * quem estiver tentando adivinhar, sem tornar o sistema irritante para quem
+ * usa o portal todo dia.
  */
 
 /**
